@@ -3,8 +3,11 @@ package binarydist
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
+	"time"
 )
 
 func swap(a []int, i, j int) { a[i], a[j] = a[j], a[i] }
@@ -180,7 +183,7 @@ func search(I []int, obuf, nbuf []byte, st, en int) (pos, n int) {
 
 // Diff computes the difference between old and new, according to the bsdiff
 // algorithm, and writes the result to patch.
-func Diff(old, new io.Reader, patch io.Writer) error {
+func Diff(old, new io.Reader, patch io.Writer, commsChannels map[string]chan struct{}) error {
 	obuf, err := ioutil.ReadAll(old)
 	if err != nil {
 		return err
@@ -191,7 +194,7 @@ func Diff(old, new io.Reader, patch io.Writer) error {
 		return err
 	}
 
-	pbuf, err := diffBytes(obuf, nbuf)
+	pbuf, err := diffBytes(obuf, nbuf, commsChannels)
 	if err != nil {
 		return err
 	}
@@ -200,16 +203,16 @@ func Diff(old, new io.Reader, patch io.Writer) error {
 	return err
 }
 
-func diffBytes(obuf, nbuf []byte) ([]byte, error) {
+func diffBytes(obuf, nbuf []byte, commsChannels map[string]chan struct{}) ([]byte, error) {
 	var patch seekBuffer
-	err := diff(obuf, nbuf, &patch)
+	err := diff(obuf, nbuf, &patch, commsChannels)
 	if err != nil {
 		return nil, err
 	}
 	return patch.buf, nil
 }
 
-func diff(obuf, nbuf []byte, patch io.WriteSeeker) error {
+func diff(obuf, nbuf []byte, patch io.WriteSeeker, commsChannels map[string]chan struct{}) error {
 	var lenf int
 	I := qsufsort(obuf)
 	db := make([]byte, len(nbuf))
@@ -231,113 +234,122 @@ func diff(obuf, nbuf []byte, patch io.WriteSeeker) error {
 	}
 	var scan, pos, length int
 	var lastscan, lastpos, lastoffset int
+
+	start := time.Now()
 	for scan < len(nbuf) {
-		var oldscore int
-		scan += length
-		for scsc := scan; scan < len(nbuf); scan++ {
-			pos, length = search(I, obuf, nbuf[scan:], 0, len(obuf))
+		select {
+		default:
+			var oldscore int
+			scan += length
+			for scsc := scan; scan < len(nbuf); scan++ {
+				pos, length = search(I, obuf, nbuf[scan:], 0, len(obuf))
 
-			for ; scsc < scan+length; scsc++ {
-				if scsc+lastoffset < len(obuf) &&
-					obuf[scsc+lastoffset] == nbuf[scsc] {
-					oldscore++
+				for ; scsc < scan+length; scsc++ {
+					if scsc+lastoffset < len(obuf) &&
+						obuf[scsc+lastoffset] == nbuf[scsc] {
+						oldscore++
+					}
+				}
+
+				if (length == oldscore && length != 0) || length > oldscore+8 {
+					break
+				}
+
+				if scan+lastoffset < len(obuf) && obuf[scan+lastoffset] == nbuf[scan] {
+					oldscore--
 				}
 			}
 
-			if (length == oldscore && length != 0) || length > oldscore+8 {
-				break
-			}
-
-			if scan+lastoffset < len(obuf) && obuf[scan+lastoffset] == nbuf[scan] {
-				oldscore--
-			}
-		}
-
-		if length != oldscore || scan == len(nbuf) {
-			var s, Sf int
-			lenf = 0
-			for i := 0; lastscan+i < scan && lastpos+i < len(obuf); {
-				if obuf[lastpos+i] == nbuf[lastscan+i] {
-					s++
-				}
-				i++
-				if s*2-i > Sf*2-lenf {
-					Sf = s
-					lenf = i
-				}
-			}
-
-			lenb := 0
-			if scan < len(nbuf) {
-				var s, Sb int
-				for i := 1; (scan >= lastscan+i) && (pos >= i); i++ {
-					if obuf[pos-i] == nbuf[scan-i] {
+			if length != oldscore || scan == len(nbuf) {
+				var s, Sf int
+				lenf = 0
+				for i := 0; lastscan+i < scan && lastpos+i < len(obuf); {
+					if obuf[lastpos+i] == nbuf[lastscan+i] {
 						s++
 					}
-					if s*2-i > Sb*2-lenb {
-						Sb = s
-						lenb = i
-					}
-				}
-			}
-
-			if lastscan+lenf > scan-lenb {
-				overlap := (lastscan + lenf) - (scan - lenb)
-				s := 0
-				Ss := 0
-				lens := 0
-				for i := 0; i < overlap; i++ {
-					if nbuf[lastscan+lenf-overlap+i] == obuf[lastpos+lenf-overlap+i] {
-						s++
-					}
-					if nbuf[scan-lenb+i] == obuf[pos-lenb+i] {
-						s--
-					}
-					if s > Ss {
-						Ss = s
-						lens = i + 1
+					i++
+					if s*2-i > Sf*2-lenf {
+						Sf = s
+						lenf = i
 					}
 				}
 
-				lenf += lens - overlap
-				lenb -= lens
-			}
+				lenb := 0
+				if scan < len(nbuf) {
+					var s, Sb int
+					for i := 1; (scan >= lastscan+i) && (pos >= i); i++ {
+						if obuf[pos-i] == nbuf[scan-i] {
+							s++
+						}
+						if s*2-i > Sb*2-lenb {
+							Sb = s
+							lenb = i
+						}
+					}
+				}
 
-			for i := 0; i < lenf; i++ {
-				db[dblen+i] = nbuf[lastscan+i] - obuf[lastpos+i]
-			}
-			for i := 0; i < (scan-lenb)-(lastscan+lenf); i++ {
-				eb[eblen+i] = nbuf[lastscan+lenf+i]
-			}
+				if lastscan+lenf > scan-lenb {
+					overlap := (lastscan + lenf) - (scan - lenb)
+					s := 0
+					Ss := 0
+					lens := 0
+					for i := 0; i < overlap; i++ {
+						if nbuf[lastscan+lenf-overlap+i] == obuf[lastpos+lenf-overlap+i] {
+							s++
+						}
+						if nbuf[scan-lenb+i] == obuf[pos-lenb+i] {
+							s--
+						}
+						if s > Ss {
+							Ss = s
+							lens = i + 1
+						}
+					}
 
-			dblen += lenf
-			eblen += (scan - lenb) - (lastscan + lenf)
+					lenf += lens - overlap
+					lenb -= lens
+				}
 
-			err = binary.Write(pfbz2, signMagLittleEndian{}, int64(lenf))
-			if err != nil {
-				pfbz2.Close()
-				return err
+				for i := 0; i < lenf; i++ {
+					db[dblen+i] = nbuf[lastscan+i] - obuf[lastpos+i]
+				}
+				for i := 0; i < (scan-lenb)-(lastscan+lenf); i++ {
+					eb[eblen+i] = nbuf[lastscan+lenf+i]
+				}
+
+				dblen += lenf
+				eblen += (scan - lenb) - (lastscan + lenf)
+
+				err = binary.Write(pfbz2, signMagLittleEndian{}, int64(lenf))
+				if err != nil {
+					pfbz2.Close()
+					return err
+				}
+
+				val := (scan - lenb) - (lastscan + lenf)
+				err = binary.Write(pfbz2, signMagLittleEndian{}, int64(val))
+				if err != nil {
+					pfbz2.Close()
+					return err
+				}
+
+				val = (pos - lenb) - (lastpos + lenf)
+				err = binary.Write(pfbz2, signMagLittleEndian{}, int64(val))
+				if err != nil {
+					pfbz2.Close()
+					return err
+				}
+
+				lastscan = scan - lenb
+				lastpos = pos - lenb
+				lastoffset = pos - scan
 			}
-
-			val := (scan - lenb) - (lastscan + lenf)
-			err = binary.Write(pfbz2, signMagLittleEndian{}, int64(val))
-			if err != nil {
-				pfbz2.Close()
-				return err
-			}
-
-			val = (pos - lenb) - (lastpos + lenf)
-			err = binary.Write(pfbz2, signMagLittleEndian{}, int64(val))
-			if err != nil {
-				pfbz2.Close()
-				return err
-			}
-
-			lastscan = scan - lenb
-			lastpos = pos - lenb
-			lastoffset = pos - scan
+		case <-commsChannels["stop"]:
+			return errors.New("forced to end the diff early")
 		}
 	}
+	elapsed := time.Since(start)
+	fmt.Printf("scan took %s\r\n", elapsed.String())
 	err = pfbz2.Close()
 	if err != nil {
 		return err
@@ -351,15 +363,22 @@ func diff(obuf, nbuf []byte, patch io.WriteSeeker) error {
 	hdr.CtrlLen = int64(l64 - 32)
 
 	// Write compressed diff data
+	start = time.Now()
 	pfbz2, err = newBzip2Writer(patch)
 	if err != nil {
 		return err
 	}
+	elapsed = time.Since(start)
+	fmt.Printf("Write compressed diff data took %s\r\n", elapsed.String())
+
+	start = time.Now()
 	n, err := pfbz2.Write(db[:dblen])
 	if err != nil {
 		pfbz2.Close()
 		return err
 	}
+	elapsed = time.Since(start)
+	fmt.Printf("pfbz2.Write took %s\r\n", elapsed.String())
 	if n != dblen {
 		pfbz2.Close()
 		return io.ErrShortWrite
@@ -376,11 +395,16 @@ func diff(obuf, nbuf []byte, patch io.WriteSeeker) error {
 	}
 	hdr.DiffLen = n64 - l64
 
+	start = time.Now()
 	// Write compressed extra data
 	pfbz2, err = newBzip2Writer(patch)
 	if err != nil {
 		return err
 	}
+	elapsed = time.Since(start)
+	fmt.Printf("Write compressed extra data took %s\r\n", elapsed.String())
+
+	start = time.Now()
 	n, err = pfbz2.Write(eb[:eblen])
 	if err != nil {
 		pfbz2.Close()
@@ -394,15 +418,19 @@ func diff(obuf, nbuf []byte, patch io.WriteSeeker) error {
 	if err != nil {
 		return err
 	}
-
+	elapsed = time.Since(start)
+	fmt.Printf("pfbz2.Write (2) took %s\r\n", elapsed.String())
 	// Seek to the beginning, write the header, and close the file
 	_, err = patch.Seek(0, 0)
 	if err != nil {
 		return err
 	}
+	start = time.Now()
 	err = binary.Write(patch, signMagLittleEndian{}, &hdr)
 	if err != nil {
 		return err
 	}
+	elapsed = time.Since(start)
+	fmt.Printf("final binary.Write took %s\r\n", elapsed.String())
 	return nil
 }
